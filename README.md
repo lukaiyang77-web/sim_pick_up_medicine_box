@@ -1,0 +1,1 @@
+# sim_pick_up_medicine_box
