@@ -174,11 +174,14 @@ def front_texture_candidates(class_name: str) -> list[Path]:
         base / "raw" / "front_box.png",
         base / "raw" / "front_blue.png",
         base / "raw" / "front_red.png",
+        base / "raw" / "front.png",
         base / "front.png",
+        base / "views" / "angle.png",
+        base / "views" / "back.png",
     ]
 
 
-def find_front_texture(class_name: str) -> Path | None:
+def find_texture_for_class(class_name: str) -> Path | None:
     for candidate in front_texture_candidates(class_name):
         if candidate.exists() and candidate.is_file():
             return candidate
@@ -187,6 +190,62 @@ def find_front_texture(class_name: str) -> Path | None:
         return None
     matches = sorted(base.glob("**/front*.png"))
     return matches[0] if matches else None
+
+
+def find_front_texture(class_name: str) -> Path | None:
+    return find_texture_for_class(class_name)
+
+
+def create_colored_material(stage, UsdShade, Sdf, Gf, name: str, color: list[float]):
+    material_path = f"/World/Looks/{name}"
+    material = UsdShade.Material.Define(stage, material_path)
+    shader = UsdShade.Shader.Define(stage, f"{material_path}/PreviewSurface")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.45)
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+    material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    return material
+
+
+def create_textured_material(stage, UsdShade, Sdf, Gf, name: str, color: list[float], texture_path: Path):
+    material_path = f"/World/Looks/{name}"
+    material = UsdShade.Material.Define(stage, material_path)
+    preview = UsdShade.Shader.Define(stage, f"{material_path}/PreviewSurface")
+    preview.CreateIdAttr("UsdPreviewSurface")
+    preview.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.5)
+    preview.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+
+    diffuse_input = preview.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f)
+    diffuse_input.Set(Gf.Vec3f(*color))
+
+    texture = UsdShade.Shader.Define(stage, f"{material_path}/Texture")
+    texture.CreateIdAttr("UsdUVTexture")
+    texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(texture_path.as_posix()))
+    texture.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+    texture.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+    texture.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+    texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+    st_reader = UsdShade.Shader.Define(stage, f"{material_path}/PrimvarReader")
+    st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+    st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+    st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+    texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_reader.ConnectableAPI(), "result")
+    diffuse_input.ConnectToSource(texture.ConnectableAPI(), "rgb")
+
+    material.CreateSurfaceOutput().ConnectToSource(preview.ConnectableAPI(), "surface")
+    return material
+
+
+def bind_material_to_prim(UsdShade, prim, material) -> bool:
+    try:
+        UsdShade.MaterialBindingAPI.Apply(prim)
+        UsdShade.MaterialBindingAPI(prim).Bind(material)
+        return True
+    except Exception as exc:
+        print(f"Warning: material bind failed for {prim.GetPath()}: {exc}")
+        return False
 
 
 def select_unique_classes(
@@ -277,7 +336,7 @@ def build_scene_metadata(
     dimensions = dimensions_dict(box_scale)
 
     for index, class_name in enumerate(classes):
-        texture = None
+        texture = find_texture_for_class(class_name) if use_textures else None
         object_yaw = yaw if class_name == target_class else rng.choice([0.0, 35.0, -35.0, 90.0])
         if condition.startswith("occlusion") and class_name != target_class and index == 1:
             object_yaw = yaw
@@ -295,9 +354,14 @@ def build_scene_metadata(
                 condition=condition,
                 is_target=class_name == target_class,
                 material_color=CLASS_COLORS[class_name],
-                texture_path=None,
+                texture_path=str(texture.relative_to(project_root()).as_posix()) if texture else None,
                 used_texture=False,
             ).to_metadata()
+        )
+        objects[-1]["texture_candidate_path"] = objects[-1]["texture_path"]
+        objects[-1]["texture_binding_method"] = "pending_texture" if texture else "fallback_color"
+        objects[-1]["texture_error"] = None if texture else (
+            "use_textures disabled" if not use_textures else "no texture candidate found"
         )
 
     metadata = {

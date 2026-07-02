@@ -15,7 +15,10 @@ from visual_scene_utils import (
     DEBUG_BIG_CUBE,
     DEFAULT_OUTPUT_DIR,
     TABLE_POSE,
+    bind_material_to_prim,
     build_scene_metadata,
+    create_colored_material,
+    create_textured_material,
     ensure_camera_mode,
     ensure_capture_mode,
     ensure_supported,
@@ -91,28 +94,6 @@ def safe_import_runtime_modules():
     }
 
 
-def create_material(stage, UsdShade, Sdf, Gf, name: str, color: list[float]):
-    material_path = f"/World/Looks/{name}"
-    material = UsdShade.Material.Define(stage, material_path)
-    shader = UsdShade.Shader.Define(stage, f"{material_path}/PreviewSurface")
-    shader.CreateIdAttr("UsdPreviewSurface")
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.45)
-    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
-    material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-    return material
-
-
-def bind_material(UsdShade, prim, material) -> bool:
-    try:
-        UsdShade.MaterialBindingAPI.Apply(prim)
-        UsdShade.MaterialBindingAPI(prim).Bind(material)
-        return True
-    except Exception as exc:
-        print(f"Warning: material bind failed for {prim.GetPath()}: {exc}")
-        return False
-
-
 def add_visible_cube(
     stage,
     UsdGeom,
@@ -124,6 +105,7 @@ def add_visible_cube(
     dimensions: list[float],
     color: list[float],
     yaw_degrees: float = 0.0,
+    texture_path: Path | None = None,
 ):
     cube = UsdGeom.Cube.Define(stage, prim_path)
     cube.CreateSizeAttr(1.0)
@@ -133,9 +115,21 @@ def add_visible_cube(
     xform.SetScale(tuple(dimensions))
     xform.SetRotate((0.0, 0.0, yaw_degrees), UsdGeom.XformCommonAPI.RotationOrderXYZ)
     UsdGeom.Imageable(prim).CreateVisibilityAttr().Set(UsdGeom.Tokens.inherited)
-    material = create_material(stage, UsdShade, Sdf, Gf, prim_path.strip("/").replace("/", "_"), color)
-    material_bound = bind_material(UsdShade, prim, material)
-    return prim, material_bound
+    material_name = prim_path.strip("/").replace("/", "_")
+    texture_error = None
+    texture_binding_method = "fallback_color"
+    if texture_path is not None:
+        try:
+            material = create_textured_material(stage, UsdShade, Sdf, Gf, material_name, color, texture_path)
+            texture_binding_method = "UsdShadePreviewSurface"
+        except Exception as exc:
+            texture_error = str(exc)
+            print(f"Warning: textured material failed for {prim_path}: {texture_error}. Falling back to color.")
+            material = create_colored_material(stage, UsdShade, Sdf, Gf, material_name, color)
+    else:
+        material = create_colored_material(stage, UsdShade, Sdf, Gf, material_name, color)
+    material_bound = bind_material_to_prim(UsdShade, prim, material)
+    return prim, material_bound, texture_binding_method, texture_error
 
 
 def add_lighting(stage, UsdLux) -> None:
@@ -319,7 +313,13 @@ def build_usd_scene(metadata: dict) -> dict:
         yaw = obj["pose"]["rotation_euler_degrees"][2]
         prim_path = f"/World/MedicineBoxes/{obj['instance_id']}"
         obj["prim_path"] = prim_path
-        add_visible_cube(
+        texture_path = None
+        if metadata["requested_use_textures"] and obj.get("texture_candidate_path"):
+            texture_path = resolve_project_path(obj["texture_candidate_path"])
+            if not texture_path.exists():
+                obj["texture_error"] = f"texture candidate does not exist: {obj['texture_candidate_path']}"
+                texture_path = None
+        prim, material_bound, texture_binding_method, texture_error = add_visible_cube(
             stage,
             UsdGeom,
             UsdShade,
@@ -330,7 +330,17 @@ def build_usd_scene(metadata: dict) -> dict:
             dimensions,
             obj["material_color"],
             yaw,
+            texture_path,
         )
+        obj["used_texture"] = texture_binding_method != "fallback_color" and texture_error is None
+        obj["texture_binding_method"] = texture_binding_method
+        obj["texture_error"] = texture_error or obj.get("texture_error")
+        if not obj["used_texture"] and obj["texture_error"] is None:
+            obj["texture_error"] = (
+                "use_textures disabled"
+                if not metadata["requested_use_textures"]
+                else "texture unavailable; used fallback color"
+            )
 
     debug_cube = metadata.get("debug_big_cube", {})
     if debug_cube.get("enabled"):
@@ -345,6 +355,8 @@ def build_usd_scene(metadata: dict) -> dict:
             debug_cube["dimensions"],
             debug_cube["color"],
         )
+
+    metadata["use_textures"] = any(obj.get("used_texture") for obj in metadata["objects"])
 
     world.reset()
     for _ in range(3):
@@ -540,9 +552,6 @@ def main() -> int:
         capture_mode=args.capture_mode,
         debug_big_cube=args.debug_big_cube,
     )
-
-    if args.use_textures:
-        print("Warning: textures are temporarily disabled for visual scene visibility debugging.")
 
     app = None
     try:

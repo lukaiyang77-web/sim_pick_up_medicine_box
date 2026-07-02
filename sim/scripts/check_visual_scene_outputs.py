@@ -29,12 +29,15 @@ REQUIRED_OBJECT_KEYS = {
     "stage_prim_exists",
     "actual_translation",
     "actual_scale",
+    "used_texture",
+    "texture_binding_method",
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check visual scene v1 preview outputs.")
     parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--require_textures", action="store_true")
     return parser.parse_args()
 
 
@@ -46,7 +49,7 @@ def load_json(path: Path, errors: list[str]) -> dict | None:
         return None
 
 
-def validate_metadata(condition: str, metadata: dict, errors: list[str]) -> None:
+def validate_metadata(condition: str, metadata: dict, errors: list[str], texture_stats: dict) -> None:
     missing = REQUIRED_METADATA_KEYS - set(metadata)
     if missing:
         errors.append(f"{condition}: metadata missing keys: {sorted(missing)}")
@@ -101,11 +104,23 @@ def validate_metadata(condition: str, metadata: dict, errors: list[str]) -> None
             errors.append(f"{condition}: object {index} missing actual_translation")
         if not obj.get("actual_scale"):
             errors.append(f"{condition}: object {index} missing actual_scale")
+        if obj.get("used_texture") is True:
+            texture_stats["texture_success_count"] += 1
+        else:
+            texture_stats["texture_fallback_count"] += 1
+            class_name = obj.get("class_name", "unknown")
+            texture_stats["fallback_classes"].add(class_name)
+            texture_stats["warnings"].append(
+                f"{condition}: {class_name} used fallback material "
+                f"({obj.get('texture_error') or obj.get('texture_binding_method')})"
+            )
 
 
 def validate_debug_big_cube(output_dir: Path, errors: list[str], lines: list[str]) -> None:
     image_path = output_dir / "debug_big_cube.png"
     metadata_path = output_dir / "debug_big_cube.json"
+    if not image_path.exists() and not metadata_path.exists():
+        return
     if not image_path.exists():
         errors.append("debug_big_cube: missing PNG debug_big_cube.png")
     elif image_path.stat().st_size <= 0:
@@ -131,9 +146,15 @@ def validate_debug_big_cube(output_dir: Path, errors: list[str], lines: list[str
     lines.append("OK JSON: debug_big_cube.json")
 
 
-def check_outputs(output_dir: Path) -> tuple[list[str], list[str]]:
+def check_outputs(output_dir: Path, require_textures: bool = False) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     lines: list[str] = [f"Checking visual scene v1 outputs in {output_dir}"]
+    texture_stats = {
+        "texture_success_count": 0,
+        "texture_fallback_count": 0,
+        "fallback_classes": set(),
+        "warnings": [],
+    }
 
     for condition in CONDITIONS:
         image_path, metadata_path = expected_preview_paths(output_dir)[condition]
@@ -150,10 +171,21 @@ def check_outputs(output_dir: Path) -> tuple[list[str], list[str]]:
 
         metadata = load_json(metadata_path, errors)
         if metadata is not None:
-            validate_metadata(condition, metadata, errors)
+            validate_metadata(condition, metadata, errors, texture_stats)
             lines.append(f"OK JSON: {metadata_path.name}")
 
     validate_debug_big_cube(output_dir, errors, lines)
+
+    lines.append("")
+    lines.append("Texture summary")
+    lines.append(f"- require_textures: {require_textures}")
+    lines.append(f"- texture_success_count: {texture_stats['texture_success_count']}")
+    lines.append(f"- texture_fallback_count: {texture_stats['texture_fallback_count']}")
+    fallback_classes = sorted(texture_stats["fallback_classes"])
+    lines.append(f"- fallback_classes: {fallback_classes}")
+    if require_textures and texture_stats["warnings"]:
+        lines.append("- texture warnings:")
+        lines.extend(f"  - {warning}" for warning in texture_stats["warnings"])
 
     if errors:
         lines.append("")
@@ -170,7 +202,7 @@ def main() -> int:
     args = parse_args()
     output_dir = resolve_project_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    lines, errors = check_outputs(output_dir)
+    lines, errors = check_outputs(output_dir, args.require_textures)
     summary_path = output_dir / "check_summary.txt"
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
