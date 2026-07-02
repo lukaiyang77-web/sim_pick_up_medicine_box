@@ -39,16 +39,17 @@ BOX_DIMENSIONS = {
 }
 
 CLASS_COLORS = {
-    "amoxicillin": (0.90, 0.18, 0.16),
-    "cefixime": (0.12, 0.40, 0.92),
-    "ibuprofen": (0.16, 0.68, 0.32),
-    "montmorillonite": (0.92, 0.70, 0.20),
-    "vitamin_c": (0.92, 0.36, 0.08),
+    "amoxicillin": (1.00, 0.05, 0.03),
+    "cefixime": (0.05, 0.25, 1.00),
+    "ibuprofen": (1.00, 0.48, 0.02),
+    "montmorillonite": (0.00, 0.85, 0.95),
+    "vitamin_c": (0.10, 0.75, 0.08),
 }
 
 TABLE_POSE = {
     "position": [0.0, 0.0, 0.73],
     "dimensions": [0.80, 0.60, 0.04],
+    "color": [0.92, 0.92, 0.90],
 }
 
 BIN_POSE = {
@@ -57,10 +58,19 @@ BIN_POSE = {
     "color": [0.35, 0.78, 0.86],
 }
 
-CAMERA_POSE = {
-    "position": [0.0, -0.78, 1.12],
-    "look_at": [0.0, 0.0, 0.76],
-    "fov_degrees": 45.0,
+CAMERA_MODES = {
+    "oblique": {
+        "position": [0.0, -0.55, 1.45],
+        "look_at": [0.0, 0.0, 0.76],
+        "fov_degrees": 45.0,
+        "focal_length": 22.0,
+    },
+    "top_down": {
+        "position": [0.0, -0.05, 1.65],
+        "look_at": [0.0, 0.0, 0.75],
+        "fov_degrees": 45.0,
+        "focal_length": 24.0,
+    },
 }
 
 DEFAULT_OUTPUT_DIR = Path("sim/results/visual_scene_v1")
@@ -112,12 +122,20 @@ def ensure_supported(condition: str, target_class: str) -> None:
         )
 
 
-def dimensions_dict() -> dict:
-    return dict(BOX_DIMENSIONS)
+def ensure_camera_mode(camera_mode: str) -> None:
+    if camera_mode not in CAMERA_MODES:
+        raise ValueError(f"Unsupported camera_mode: {camera_mode}. Expected one of {list(CAMERA_MODES)}.")
 
 
-def object_z() -> float:
-    return 0.75 + BOX_DIMENSIONS["height"] / 2.0
+def dimensions_dict(box_scale: float = 1.0) -> dict:
+    return {
+        key: round(value * box_scale, 5)
+        for key, value in BOX_DIMENSIONS.items()
+    }
+
+
+def object_z(box_scale: float = 1.0) -> float:
+    return 0.75 + dimensions_dict(box_scale)["height"] / 2.0
 
 
 def yaw_for_condition(condition: str) -> float:
@@ -174,8 +192,13 @@ def select_unique_classes(
     return [target_class, *distractors[:2]]
 
 
-def condition_positions(condition: str, classes: Iterable[str], target_class: str) -> dict[str, tuple[float, float]]:
-    z = object_z()
+def condition_positions(
+    condition: str,
+    classes: Iterable[str],
+    target_class: str,
+    box_scale: float,
+) -> dict[str, tuple[float, float]]:
+    z = object_z(box_scale)
     positions: dict[str, tuple[float, float]] = {}
     class_list = list(classes)
 
@@ -217,13 +240,17 @@ def build_scene_metadata(
     use_textures: bool,
     resolution_width: int,
     resolution_height: int,
+    camera_mode: str = "oblique",
+    box_scale: float = 1.3,
 ) -> dict:
     ensure_supported(condition, target_class)
+    ensure_camera_mode(camera_mode)
     rng = random.Random(seed)
     classes = select_unique_classes(condition, target_class, rng)
-    positions = condition_positions(condition, classes, target_class)
+    positions = condition_positions(condition, classes, target_class, box_scale)
     yaw = yaw_for_condition(condition)
     objects = []
+    dimensions = dimensions_dict(box_scale)
 
     for index, class_name in enumerate(classes):
         texture = find_front_texture(class_name) if use_textures else None
@@ -240,7 +267,7 @@ def build_scene_metadata(
                 class_name=class_name,
                 instance_id=f"{class_name}_{index:02d}",
                 pose=pose,
-                dimensions=dimensions_dict(),
+                dimensions=dimensions,
                 condition=condition,
                 is_target=class_name == target_class,
                 material_color=CLASS_COLORS[class_name],
@@ -255,12 +282,14 @@ def build_scene_metadata(
         "seed": seed,
         "requested_use_textures": use_textures,
         "use_textures": any(obj["used_texture"] for obj in objects),
+        "camera_mode": camera_mode,
+        "box_scale": box_scale,
         "resolution": {
             "width": resolution_width,
             "height": resolution_height,
         },
         "objects": objects,
-        "camera_pose": CAMERA_POSE,
+        "camera_pose": CAMERA_MODES[camera_mode],
         "table_pose": TABLE_POSE,
         "bin_pose": BIN_POSE,
     }

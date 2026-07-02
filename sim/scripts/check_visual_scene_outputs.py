@@ -12,6 +12,7 @@ REQUIRED_METADATA_KEYS = {
     "target_class",
     "objects",
     "camera_pose",
+    "camera_mode",
     "bin_pose",
     "use_textures",
 }
@@ -47,6 +48,8 @@ def validate_metadata(condition: str, metadata: dict, errors: list[str]) -> None
 
     if metadata["condition"] != condition:
         errors.append(f"{condition}: metadata condition is {metadata['condition']!r}")
+    if metadata.get("camera_mode") not in {"oblique", "top_down"}:
+        errors.append(f"{condition}: invalid camera_mode {metadata.get('camera_mode')!r}")
 
     objects = metadata.get("objects")
     if not isinstance(objects, list):

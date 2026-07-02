@@ -9,9 +9,11 @@ from pathlib import Path
 
 from visual_scene_utils import (
     BIN_POSE,
+    CAMERA_MODES,
     DEFAULT_OUTPUT_DIR,
     TABLE_POSE,
     build_scene_metadata,
+    ensure_camera_mode,
     ensure_supported,
     project_root,
     resolve_project_path,
@@ -29,7 +31,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_metadata", default=str(DEFAULT_OUTPUT_DIR / "preview.json"))
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use_textures", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use_textures", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--camera_mode", choices=sorted(CAMERA_MODES), default="oblique")
+    parser.add_argument("--box_scale", type=float, default=1.3)
     parser.add_argument("--resolution_width", type=int, default=1024)
     parser.add_argument("--resolution_height", type=int, default=768)
     return parser.parse_args()
@@ -139,7 +143,7 @@ def build_usd_scene(metadata: dict) -> tuple[object, object]:
 
     add_lighting(stage, UsdLux)
 
-    table_material = create_material(stage, UsdShade, Sdf, Gf, "table_mat", [0.70, 0.70, 0.68], None)
+    table_material = create_material(stage, UsdShade, Sdf, Gf, "table_mat", TABLE_POSE["color"], None)
     table_prim = add_cube(
         UsdGeom,
         stage,
@@ -209,6 +213,7 @@ def build_usd_scene(metadata: dict) -> tuple[object, object]:
             dimensions,
             yaw,
         )
+        obj["prim_path"] = prim.GetPath().pathString
         bind_material(UsdShade, prim, material)
         try:
             add_text_label(stage, UsdGeom, Gf, obj["class_name"], position, yaw)
@@ -221,10 +226,28 @@ def build_usd_scene(metadata: dict) -> tuple[object, object]:
     camera = rep.create.camera(
         position=tuple(camera_pose["position"]),
         look_at=tuple(camera_pose["look_at"]),
-        focal_length=24.0,
+        focal_length=camera_pose["focal_length"],
     )
     world.reset()
     return rep, camera
+
+
+def log_scene_debug(metadata: dict) -> None:
+    camera_pose = metadata["camera_pose"]
+    print(f"Scene condition: {metadata['condition']}")
+    print(f"Target class: {metadata['target_class']}")
+    print(f"Camera mode: {metadata['camera_mode']}")
+    print(f"Camera position: {camera_pose['position']}")
+    print(f"Camera look_at: {camera_pose['look_at']}")
+    for obj in metadata["objects"]:
+        prim_path = f"/World/MedicineBoxes/{obj['instance_id']}"
+        print(
+            "Object: "
+            f"class_name={obj['class_name']} "
+            f"position={obj['pose']['position']} "
+            f"dimensions={obj['dimensions']} "
+            f"prim_path={prim_path}"
+        )
 
 
 def copy_rendered_png(render_dir: Path, output_image: Path) -> None:
@@ -267,8 +290,12 @@ def main() -> int:
     args = parse_args()
     try:
         ensure_supported(args.condition, args.target_class)
+        ensure_camera_mode(args.camera_mode)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+    if args.box_scale <= 0:
+        print(f"box_scale must be positive, got {args.box_scale}.", file=sys.stderr)
         return 2
 
     output_image = resolve_project_path(args.output_image)
@@ -280,6 +307,8 @@ def main() -> int:
         use_textures=args.use_textures,
         resolution_width=args.resolution_width,
         resolution_height=args.resolution_height,
+        camera_mode=args.camera_mode,
+        box_scale=args.box_scale,
     )
 
     if args.use_textures and not metadata["use_textures"]:
@@ -287,6 +316,7 @@ def main() -> int:
 
     app = None
     try:
+        log_scene_debug(metadata)
         app = start_simulation_app(args.headless, args.resolution_width, args.resolution_height)
         render_scene(metadata, output_image)
         metadata["image_path"] = str(output_image.relative_to(project_root()).as_posix())
