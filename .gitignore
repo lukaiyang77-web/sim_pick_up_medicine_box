@@ -1,0 +1,8 @@
+sim/results/
+results/
+data/synthetic_images_*/
+data/crops_*/
+*.npz
+*.log
+__pycache__/
+*.pyc
