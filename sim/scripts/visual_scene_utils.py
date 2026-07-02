@@ -32,6 +32,15 @@ DEFAULT_CONDITION_TARGETS = {
     "similar_distractor": "amoxicillin",
 }
 
+CAPTURE_MODES = [
+    "camera_sensor",
+    "replicator",
+    "viewport",
+]
+
+CAMERA_PRIM_PATH = "/World/Camera"
+DEBUG_BIG_CUBE_PRIM_PATH = "/World/DebugBigRedCube"
+
 BOX_DIMENSIONS = {
     "length": 0.12,
     "width": 0.07,
@@ -56,6 +65,13 @@ BIN_POSE = {
     "position": [0.25, 0.12, 0.755],
     "dimensions": [0.24, 0.18, 0.01],
     "color": [0.35, 0.78, 0.86],
+}
+
+DEBUG_BIG_CUBE = {
+    "prim_path": DEBUG_BIG_CUBE_PRIM_PATH,
+    "position": [0.0, 0.0, 0.81],
+    "dimensions": [0.20, 0.20, 0.12],
+    "color": [1.0, 0.0, 0.0],
 }
 
 CAMERA_MODES = {
@@ -125,6 +141,11 @@ def ensure_supported(condition: str, target_class: str) -> None:
 def ensure_camera_mode(camera_mode: str) -> None:
     if camera_mode not in CAMERA_MODES:
         raise ValueError(f"Unsupported camera_mode: {camera_mode}. Expected one of {list(CAMERA_MODES)}.")
+
+
+def ensure_capture_mode(capture_mode: str) -> None:
+    if capture_mode not in CAPTURE_MODES:
+        raise ValueError(f"Unsupported capture_mode: {capture_mode}. Expected one of {CAPTURE_MODES}.")
 
 
 def dimensions_dict(box_scale: float = 1.0) -> dict:
@@ -242,9 +263,12 @@ def build_scene_metadata(
     resolution_height: int,
     camera_mode: str = "oblique",
     box_scale: float = 1.3,
+    capture_mode: str = "camera_sensor",
+    debug_big_cube: bool = False,
 ) -> dict:
     ensure_supported(condition, target_class)
     ensure_camera_mode(camera_mode)
+    ensure_capture_mode(capture_mode)
     rng = random.Random(seed)
     classes = select_unique_classes(condition, target_class, rng)
     positions = condition_positions(condition, classes, target_class, box_scale)
@@ -253,7 +277,7 @@ def build_scene_metadata(
     dimensions = dimensions_dict(box_scale)
 
     for index, class_name in enumerate(classes):
-        texture = find_front_texture(class_name) if use_textures else None
+        texture = None
         object_yaw = yaw if class_name == target_class else rng.choice([0.0, 35.0, -35.0, 90.0])
         if condition.startswith("occlusion") and class_name != target_class and index == 1:
             object_yaw = yaw
@@ -271,18 +295,22 @@ def build_scene_metadata(
                 condition=condition,
                 is_target=class_name == target_class,
                 material_color=CLASS_COLORS[class_name],
-                texture_path=str(texture.relative_to(project_root()).as_posix()) if texture else None,
-                used_texture=bool(texture),
+                texture_path=None,
+                used_texture=False,
             ).to_metadata()
         )
 
-    return {
+    metadata = {
         "condition": condition,
         "target_class": target_class,
         "seed": seed,
         "requested_use_textures": use_textures,
-        "use_textures": any(obj["used_texture"] for obj in objects),
+        "use_textures": False,
+        "requested_capture_mode": capture_mode,
+        "capture_mode": capture_mode,
         "camera_mode": camera_mode,
+        "camera_prim_path": CAMERA_PRIM_PATH,
+        "actual_capture_camera_path": None,
         "box_scale": box_scale,
         "resolution": {
             "width": resolution_width,
@@ -293,6 +321,17 @@ def build_scene_metadata(
         "table_pose": TABLE_POSE,
         "bin_pose": BIN_POSE,
     }
+    if debug_big_cube:
+        metadata["debug_big_cube"] = {
+            "enabled": True,
+            **DEBUG_BIG_CUBE,
+        }
+    else:
+        metadata["debug_big_cube"] = {
+            "enabled": False,
+            "prim_path": DEBUG_BIG_CUBE_PRIM_PATH,
+        }
+    return metadata
 
 
 def expected_preview_paths(output_dir: Path) -> dict[str, tuple[Path, Path]]:

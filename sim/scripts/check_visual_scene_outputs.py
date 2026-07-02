@@ -13,6 +13,8 @@ REQUIRED_METADATA_KEYS = {
     "objects",
     "camera_pose",
     "camera_mode",
+    "capture_mode",
+    "camera_prim_path",
     "bin_pose",
     "use_textures",
 }
@@ -23,6 +25,10 @@ REQUIRED_OBJECT_KEYS = {
     "pose",
     "dimensions",
     "is_target",
+    "prim_path",
+    "stage_prim_exists",
+    "actual_translation",
+    "actual_scale",
 }
 
 
@@ -50,6 +56,10 @@ def validate_metadata(condition: str, metadata: dict, errors: list[str]) -> None
         errors.append(f"{condition}: metadata condition is {metadata['condition']!r}")
     if metadata.get("camera_mode") not in {"oblique", "top_down"}:
         errors.append(f"{condition}: invalid camera_mode {metadata.get('camera_mode')!r}")
+    if metadata.get("capture_mode") not in {"camera_sensor", "replicator", "viewport"}:
+        errors.append(f"{condition}: invalid capture_mode {metadata.get('capture_mode')!r}")
+    if not metadata.get("camera_prim_path"):
+        errors.append(f"{condition}: missing camera_prim_path")
 
     objects = metadata.get("objects")
     if not isinstance(objects, list):
@@ -83,6 +93,42 @@ def validate_metadata(condition: str, metadata: dict, errors: list[str]) -> None
         missing_obj = REQUIRED_OBJECT_KEYS - set(obj)
         if missing_obj:
             errors.append(f"{condition}: object {index} missing keys: {sorted(missing_obj)}")
+        if obj.get("stage_prim_exists") is not True:
+            errors.append(f"{condition}: object {index} stage_prim_exists is not true")
+        if obj.get("prim_type_name") != "Cube":
+            errors.append(f"{condition}: object {index} prim_type_name is not Cube")
+        if not obj.get("actual_translation"):
+            errors.append(f"{condition}: object {index} missing actual_translation")
+        if not obj.get("actual_scale"):
+            errors.append(f"{condition}: object {index} missing actual_scale")
+
+
+def validate_debug_big_cube(output_dir: Path, errors: list[str], lines: list[str]) -> None:
+    image_path = output_dir / "debug_big_cube.png"
+    metadata_path = output_dir / "debug_big_cube.json"
+    if not image_path.exists():
+        errors.append("debug_big_cube: missing PNG debug_big_cube.png")
+    elif image_path.stat().st_size <= 0:
+        errors.append("debug_big_cube: PNG is empty debug_big_cube.png")
+    else:
+        lines.append(f"OK PNG: {image_path.name} ({image_path.stat().st_size} bytes)")
+
+    if not metadata_path.exists():
+        errors.append("debug_big_cube: missing JSON debug_big_cube.json")
+        return
+
+    metadata = load_json(metadata_path, errors)
+    if metadata is None:
+        return
+    debug_cube = metadata.get("debug_big_cube")
+    if not isinstance(debug_cube, dict):
+        errors.append("debug_big_cube: metadata missing debug_big_cube object")
+        return
+    if debug_cube.get("stage_prim_exists") is not True:
+        errors.append("debug_big_cube: DebugBigRedCube stage_prim_exists is not true")
+    if debug_cube.get("prim_path") != "/World/DebugBigRedCube":
+        errors.append(f"debug_big_cube: unexpected prim_path {debug_cube.get('prim_path')!r}")
+    lines.append("OK JSON: debug_big_cube.json")
 
 
 def check_outputs(output_dir: Path) -> tuple[list[str], list[str]]:
@@ -106,6 +152,8 @@ def check_outputs(output_dir: Path) -> tuple[list[str], list[str]]:
         if metadata is not None:
             validate_metadata(condition, metadata, errors)
             lines.append(f"OK JSON: {metadata_path.name}")
+
+    validate_debug_big_cube(output_dir, errors, lines)
 
     if errors:
         lines.append("")

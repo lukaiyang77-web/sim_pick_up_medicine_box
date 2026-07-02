@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import sys
 import tempfile
@@ -10,10 +11,13 @@ from pathlib import Path
 from visual_scene_utils import (
     BIN_POSE,
     CAMERA_MODES,
+    CAPTURE_MODES,
+    DEBUG_BIG_CUBE,
     DEFAULT_OUTPUT_DIR,
     TABLE_POSE,
     build_scene_metadata,
     ensure_camera_mode,
+    ensure_capture_mode,
     ensure_supported,
     project_root,
     resolve_project_path,
@@ -21,10 +25,12 @@ from visual_scene_utils import (
 
 
 ISAAC_IMPORT_ERROR = "Isaac Sim modules not found. Please run this script with Isaac Sim python.sh."
+TABLE_PRIM_PATH = "/World/Table"
+BIN_PRIM_PATH = "/World/SortingBin"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create a textured Isaac Sim medicine-box scene.")
+    parser = argparse.ArgumentParser(description="Create an Isaac Sim visual medicine-box scene.")
     parser.add_argument("--condition", required=True)
     parser.add_argument("--target_class", required=True)
     parser.add_argument("--output_image", default=str(DEFAULT_OUTPUT_DIR / "preview.png"))
@@ -33,7 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_textures", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--camera_mode", choices=sorted(CAMERA_MODES), default="oblique")
+    parser.add_argument("--capture_mode", choices=CAPTURE_MODES, default="camera_sensor")
     parser.add_argument("--box_scale", type=float, default=1.3)
+    parser.add_argument("--debug_big_cube", action="store_true")
     parser.add_argument("--resolution_width", type=int, default=1024)
     parser.add_argument("--resolution_height", type=int, default=768)
     return parser.parse_args()
@@ -71,183 +79,331 @@ def safe_import_runtime_modules():
     except ImportError as exc:
         raise RuntimeError(ISAAC_IMPORT_ERROR) from exc
 
-    return rep, omni.usd, Gf, Sdf, UsdGeom, UsdLux, UsdShade, World
+    return {
+        "rep": rep,
+        "omni_usd": omni.usd,
+        "Gf": Gf,
+        "Sdf": Sdf,
+        "UsdGeom": UsdGeom,
+        "UsdLux": UsdLux,
+        "UsdShade": UsdShade,
+        "World": World,
+    }
 
 
-def create_material(stage, UsdShade, Sdf, Gf, name: str, color: list[float], texture_path: Path | None):
+def create_material(stage, UsdShade, Sdf, Gf, name: str, color: list[float]):
     material_path = f"/World/Looks/{name}"
     material = UsdShade.Material.Define(stage, material_path)
     shader = UsdShade.Shader.Define(stage, f"{material_path}/PreviewSurface")
     shader.CreateIdAttr("UsdPreviewSurface")
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.55)
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.45)
     shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-
-    diffuse_input = shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f)
-    diffuse_input.Set(Gf.Vec3f(*color))
-
-    if texture_path is not None:
-        texture = UsdShade.Shader.Define(stage, f"{material_path}/Texture")
-        texture.CreateIdAttr("UsdUVTexture")
-        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(texture_path.as_posix()))
-        texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
-        diffuse_input.ConnectToSource(texture.ConnectableAPI(), "rgb")
-
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
     material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
     return material
 
 
-def bind_material(UsdShade, prim, material) -> None:
-    UsdShade.MaterialBindingAPI.Apply(prim)
-    UsdShade.MaterialBindingAPI(prim).Bind(material)
+def bind_material(UsdShade, prim, material) -> bool:
+    try:
+        UsdShade.MaterialBindingAPI.Apply(prim)
+        UsdShade.MaterialBindingAPI(prim).Bind(material)
+        return True
+    except Exception as exc:
+        print(f"Warning: material bind failed for {prim.GetPath()}: {exc}")
+        return False
 
 
-def add_cube(UsdGeom, stage, prim_path: str, position: list[float], dimensions: list[float], yaw_degrees: float):
+def add_visible_cube(
+    stage,
+    UsdGeom,
+    UsdShade,
+    Sdf,
+    Gf,
+    prim_path: str,
+    position: list[float],
+    dimensions: list[float],
+    color: list[float],
+    yaw_degrees: float = 0.0,
+):
     cube = UsdGeom.Cube.Define(stage, prim_path)
     cube.CreateSizeAttr(1.0)
+    prim = cube.GetPrim()
     xform = UsdGeom.XformCommonAPI(cube)
     xform.SetTranslate(tuple(position))
     xform.SetScale(tuple(dimensions))
     xform.SetRotate((0.0, 0.0, yaw_degrees), UsdGeom.XformCommonAPI.RotationOrderXYZ)
-    return cube.GetPrim()
-
-
-def add_text_label(stage, UsdGeom, Gf, text: str, position: list[float], yaw_degrees: float):
-    text_path = f"/World/Labels/{text}"
-    text_prim = UsdGeom.Text.Define(stage, text_path)
-    text_prim.CreateTextAttr(text)
-    text_prim.CreateHeightAttr(0.018)
-    text_prim.CreateAlignAttr("center")
-    text_prim.CreateAxisAttr("Z")
-    xform = UsdGeom.XformCommonAPI(text_prim)
-    xform.SetTranslate((position[0], position[1], position[2] + 0.019))
-    xform.SetRotate((0.0, 0.0, yaw_degrees), UsdGeom.XformCommonAPI.RotationOrderXYZ)
-    xform.SetScale((1.0, 1.0, 1.0))
-    return text_prim.GetPrim()
+    UsdGeom.Imageable(prim).CreateVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+    material = create_material(stage, UsdShade, Sdf, Gf, prim_path.strip("/").replace("/", "_"), color)
+    material_bound = bind_material(UsdShade, prim, material)
+    return prim, material_bound
 
 
 def add_lighting(stage, UsdLux) -> None:
     dome = UsdLux.DomeLight.Define(stage, "/World/DomeLight")
-    dome.CreateIntensityAttr(450.0)
+    dome.CreateIntensityAttr(600.0)
     distant = UsdLux.DistantLight.Define(stage, "/World/KeyLight")
-    distant.CreateIntensityAttr(900.0)
-    distant.CreateAngleAttr(0.4)
+    distant.CreateIntensityAttr(1000.0)
+    distant.CreateAngleAttr(0.5)
 
 
-def build_usd_scene(metadata: dict) -> tuple[object, object]:
-    rep, omni_usd, Gf, Sdf, UsdGeom, UsdLux, UsdShade, World = safe_import_runtime_modules()
+def camera_rotation_degrees(position: list[float], look_at: list[float]) -> tuple[float, float, float]:
+    dx = look_at[0] - position[0]
+    dy = look_at[1] - position[1]
+    dz = look_at[2] - position[2]
+    horizontal = math.sqrt(dx * dx + dy * dy)
+    pitch = math.degrees(math.atan2(horizontal, -dz))
+    yaw = math.degrees(math.atan2(-dx, dy)) if horizontal > 1e-8 else 0.0
+    return pitch, 0.0, yaw
+
+
+def create_camera_prim(stage, UsdGeom, Gf, metadata: dict):
+    camera_pose = metadata["camera_pose"]
+    camera_path = metadata["camera_prim_path"]
+    camera = UsdGeom.Camera.Define(stage, camera_path)
+    prim = camera.GetPrim()
+    camera.CreateFocalLengthAttr(camera_pose["focal_length"])
+    camera.CreateClippingRangeAttr(Gf.Vec2f(0.01, 100.0))
+    xform = UsdGeom.XformCommonAPI(camera)
+    xform.SetTranslate(tuple(camera_pose["position"]))
+    xform.SetRotate(
+        camera_rotation_degrees(camera_pose["position"], camera_pose["look_at"]),
+        UsdGeom.XformCommonAPI.RotationOrderXYZ,
+    )
+    UsdGeom.Imageable(prim).CreateVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+    return prim
+
+
+def vector_to_list(value) -> list[float] | None:
+    if value is None:
+        return None
+    try:
+        return [round(float(item), 5) for item in value]
+    except TypeError:
+        return [round(float(value), 5)]
+
+
+def get_xform_values(UsdGeom, prim) -> tuple[list[float] | None, list[float] | None]:
+    translation = None
+    scale = None
+    if not prim.IsValid():
+        return translation, scale
+    xformable = UsdGeom.Xformable(prim)
+    for op in xformable.GetOrderedXformOps():
+        op_name = op.GetOpName()
+        if op_name.endswith(":translate"):
+            translation = vector_to_list(op.Get())
+        elif op_name.endswith(":scale"):
+            scale = vector_to_list(op.Get())
+    return translation, scale
+
+
+def inspect_prim(stage, UsdGeom, UsdShade, prim_path: str) -> dict:
+    prim = stage.GetPrimAtPath(prim_path)
+    info = {
+        "prim_path": prim_path,
+        "stage_prim_exists": prim.IsValid(),
+        "prim_type_name": None,
+        "actual_translation": None,
+        "actual_scale": None,
+        "visibility": None,
+        "material_bound": False,
+    }
+    if not prim.IsValid():
+        return info
+
+    translation, scale = get_xform_values(UsdGeom, prim)
+    info["prim_type_name"] = prim.GetTypeName()
+    info["actual_translation"] = translation
+    info["actual_scale"] = scale
+    info["visibility"] = UsdGeom.Imageable(prim).ComputeVisibility()
+    try:
+        bound_material = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()[0]
+        info["material_bound"] = bool(bound_material and bound_material.GetPrim().IsValid())
+    except Exception:
+        info["material_bound"] = False
+    return info
+
+
+def update_stage_metadata(stage, UsdGeom, UsdShade, metadata: dict) -> None:
+    for obj in metadata["objects"]:
+        prim_path = obj["prim_path"]
+        obj.update(inspect_prim(stage, UsdGeom, UsdShade, prim_path))
+
+    debug_cube = metadata.get("debug_big_cube", {})
+    if debug_cube.get("enabled"):
+        debug_cube.update(inspect_prim(stage, UsdGeom, UsdShade, debug_cube["prim_path"]))
+
+
+def format_stage_dump(stage, UsdGeom, UsdShade, metadata: dict) -> str:
+    prim_paths = [
+        metadata["camera_prim_path"],
+        TABLE_PRIM_PATH,
+        BIN_PRIM_PATH,
+        *[obj["prim_path"] for obj in metadata["objects"]],
+        metadata["debug_big_cube"]["prim_path"],
+    ]
+    lines = [
+        f"condition: {metadata['condition']}",
+        f"target_class: {metadata['target_class']}",
+        f"camera_mode: {metadata['camera_mode']}",
+        f"capture_mode: {metadata['capture_mode']}",
+        "",
+    ]
+    for prim_path in prim_paths:
+        info = inspect_prim(stage, UsdGeom, UsdShade, prim_path)
+        lines.append(f"prim_path: {prim_path}")
+        lines.append(f"  exists: {info['stage_prim_exists']}")
+        lines.append(f"  type: {info['prim_type_name']}")
+        lines.append(f"  translation: {info['actual_translation']}")
+        lines.append(f"  scale: {info['actual_scale']}")
+        lines.append(f"  visibility: {info['visibility']}")
+        lines.append(f"  material_bound: {info['material_bound']}")
+    return "\n".join(lines) + "\n"
+
+
+def write_stage_dump(stage, UsdGeom, UsdShade, metadata: dict, output_metadata: Path) -> None:
+    if metadata["condition"] not in {"front", "similar_distractor"}:
+        return
+    dump_path = output_metadata.parent / f"stage_dump_{metadata['condition']}.txt"
+    dump_path.write_text(format_stage_dump(stage, UsdGeom, UsdShade, metadata), encoding="utf-8")
+    metadata["stage_dump_path"] = str(dump_path.relative_to(project_root()).as_posix())
+
+
+def build_usd_scene(metadata: dict) -> dict:
+    modules = safe_import_runtime_modules()
+    rep = modules["rep"]
+    omni_usd = modules["omni_usd"]
+    Gf = modules["Gf"]
+    Sdf = modules["Sdf"]
+    UsdGeom = modules["UsdGeom"]
+    UsdLux = modules["UsdLux"]
+    UsdShade = modules["UsdShade"]
+    World = modules["World"]
+
     world = World(stage_units_in_meters=1.0)
     stage = omni_usd.get_context().get_stage()
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
     UsdGeom.Scope.Define(stage, "/World/Looks")
-    UsdGeom.Scope.Define(stage, "/World/Labels")
+    UsdGeom.Scope.Define(stage, "/World/MedicineBoxes")
 
     add_lighting(stage, UsdLux)
+    create_camera_prim(stage, UsdGeom, Gf, metadata)
 
-    table_material = create_material(stage, UsdShade, Sdf, Gf, "table_mat", TABLE_POSE["color"], None)
-    table_prim = add_cube(
-        UsdGeom,
+    add_visible_cube(
         stage,
-        "/World/Table",
+        UsdGeom,
+        UsdShade,
+        Sdf,
+        Gf,
+        TABLE_PRIM_PATH,
         TABLE_POSE["position"],
         TABLE_POSE["dimensions"],
-        0.0,
+        TABLE_POSE["color"],
     )
-    bind_material(UsdShade, table_prim, table_material)
-
-    bin_material = create_material(stage, UsdShade, Sdf, Gf, "bin_mat", BIN_POSE["color"], None)
-    bin_prim = add_cube(
-        UsdGeom,
+    add_visible_cube(
         stage,
-        "/World/SortingBin",
+        UsdGeom,
+        UsdShade,
+        Sdf,
+        Gf,
+        BIN_PRIM_PATH,
         BIN_POSE["position"],
         BIN_POSE["dimensions"],
-        0.0,
+        BIN_POSE["color"],
     )
-    bind_material(UsdShade, bin_prim, bin_material)
 
     for obj in metadata["objects"]:
-        color = obj["material_color"]
-        texture = resolve_project_path(obj["texture_path"]) if obj["texture_path"] else None
-        if texture is not None and not texture.exists():
-            print(f"Warning: texture missing for {obj['class_name']}: {texture}. Falling back to color.")
-            texture = None
-            obj["used_texture"] = False
-
-        if obj["texture_path"] is None and metadata["requested_use_textures"]:
-            print(f"Warning: no texture found for {obj['class_name']}. Falling back to color.")
-
-        try:
-            material = create_material(
-                stage,
-                UsdShade,
-                Sdf,
-                Gf,
-                f"{obj['instance_id']}_mat",
-                color,
-                texture,
-            )
-        except Exception as exc:
-            print(
-                f"Warning: texture material failed for {obj['class_name']}: {exc}. "
-                "Falling back to color."
-            )
-            obj["used_texture"] = False
-            material = create_material(
-                stage,
-                UsdShade,
-                Sdf,
-                Gf,
-                f"{obj['instance_id']}_fallback_mat",
-                color,
-                None,
-            )
         dims = obj["dimensions"]
         dimensions = [dims["length"], dims["width"], dims["height"]]
         position = obj["pose"]["position"]
         yaw = obj["pose"]["rotation_euler_degrees"][2]
-        prim = add_cube(
-            UsdGeom,
+        prim_path = f"/World/MedicineBoxes/{obj['instance_id']}"
+        obj["prim_path"] = prim_path
+        add_visible_cube(
             stage,
-            f"/World/MedicineBoxes/{obj['instance_id']}",
+            UsdGeom,
+            UsdShade,
+            Sdf,
+            Gf,
+            prim_path,
             position,
             dimensions,
+            obj["material_color"],
             yaw,
         )
-        obj["prim_path"] = prim.GetPath().pathString
-        bind_material(UsdShade, prim, material)
-        try:
-            add_text_label(stage, UsdGeom, Gf, obj["class_name"], position, yaw)
-        except Exception as exc:
-            print(f"Warning: label creation failed for {obj['class_name']}: {exc}.")
 
-    metadata["use_textures"] = any(obj["used_texture"] for obj in metadata["objects"])
-
-    camera_pose = metadata["camera_pose"]
-    camera = rep.create.camera(
-        position=tuple(camera_pose["position"]),
-        look_at=tuple(camera_pose["look_at"]),
-        focal_length=camera_pose["focal_length"],
-    )
-    world.reset()
-    return rep, camera
-
-
-def log_scene_debug(metadata: dict) -> None:
-    camera_pose = metadata["camera_pose"]
-    print(f"Scene condition: {metadata['condition']}")
-    print(f"Target class: {metadata['target_class']}")
-    print(f"Camera mode: {metadata['camera_mode']}")
-    print(f"Camera position: {camera_pose['position']}")
-    print(f"Camera look_at: {camera_pose['look_at']}")
-    for obj in metadata["objects"]:
-        prim_path = f"/World/MedicineBoxes/{obj['instance_id']}"
-        print(
-            "Object: "
-            f"class_name={obj['class_name']} "
-            f"position={obj['pose']['position']} "
-            f"dimensions={obj['dimensions']} "
-            f"prim_path={prim_path}"
+    debug_cube = metadata.get("debug_big_cube", {})
+    if debug_cube.get("enabled"):
+        add_visible_cube(
+            stage,
+            UsdGeom,
+            UsdShade,
+            Sdf,
+            Gf,
+            debug_cube["prim_path"],
+            debug_cube["position"],
+            debug_cube["dimensions"],
+            debug_cube["color"],
         )
+
+    world.reset()
+    for _ in range(3):
+        world.step(render=True)
+
+    return {
+        "rep": rep,
+        "stage": stage,
+        "world": world,
+        "UsdGeom": UsdGeom,
+        "UsdShade": UsdShade,
+    }
+
+
+def save_rgba_png(rgba, output_image: Path) -> None:
+    output_image.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow and numpy are required to save camera sensor RGBA output.") from exc
+
+    array = np.asarray(rgba)
+    if array.size == 0:
+        raise RuntimeError("Camera sensor returned an empty RGBA frame.")
+    if array.dtype != np.uint8:
+        if array.max() <= 1.0:
+            array = (array * 255.0).clip(0, 255).astype(np.uint8)
+        else:
+            array = array.clip(0, 255).astype(np.uint8)
+    if array.shape[-1] == 4:
+        image = Image.fromarray(array, mode="RGBA")
+    elif array.shape[-1] == 3:
+        image = Image.fromarray(array, mode="RGB")
+    else:
+        raise RuntimeError(f"Unsupported camera frame shape: {array.shape}")
+    image.save(output_image)
+
+
+def capture_camera_sensor(world, metadata: dict, output_image: Path) -> None:
+    try:
+        try:
+            from isaacsim.sensors.camera import Camera
+        except ImportError:
+            from omni.isaac.sensor import Camera
+    except ImportError as exc:
+        raise RuntimeError("Isaac Sim Camera sensor module is not available.") from exc
+
+    camera = Camera(
+        prim_path=metadata["camera_prim_path"],
+        resolution=(metadata["resolution"]["width"], metadata["resolution"]["height"]),
+    )
+    camera.initialize()
+    if hasattr(camera, "add_rgba_to_frame"):
+        camera.add_rgba_to_frame()
+    for _ in range(8):
+        world.step(render=True)
+    rgba = camera.get_rgba()
+    save_rgba_png(rgba, output_image)
 
 
 def copy_rendered_png(render_dir: Path, output_image: Path) -> None:
@@ -258,12 +414,11 @@ def copy_rendered_png(render_dir: Path, output_image: Path) -> None:
     shutil.copy2(pngs[-1], output_image)
 
 
-def render_scene(metadata: dict, output_image: Path) -> None:
-    rep, camera = build_usd_scene(metadata)
+def capture_replicator(rep, metadata: dict, output_image: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="visual_scene_v1_") as tmp:
         render_dir = Path(tmp)
         render_product = rep.create.render_product(
-            camera,
+            metadata["camera_prim_path"],
             (metadata["resolution"]["width"], metadata["resolution"]["height"]),
         )
         writer = rep.WriterRegistry.get("BasicWriter")
@@ -281,6 +436,78 @@ def render_scene(metadata: dict, output_image: Path) -> None:
         copy_rendered_png(render_dir, output_image)
 
 
+def capture_viewport(metadata: dict, output_image: Path) -> None:
+    try:
+        import omni.kit.viewport.utility as viewport_utility
+    except ImportError as exc:
+        raise RuntimeError("Viewport capture utility is not available.") from exc
+
+    viewport = viewport_utility.get_active_viewport()
+    if viewport is None:
+        raise RuntimeError("No active viewport is available for viewport capture.")
+    viewport.camera_path = metadata["camera_prim_path"]
+    output_image.parent.mkdir(parents=True, exist_ok=True)
+    capture = viewport_utility.capture_viewport_to_file(viewport, str(output_image))
+    if hasattr(capture, "wait_for_result"):
+        capture.wait_for_result()
+    if not output_image.exists() or output_image.stat().st_size <= 0:
+        raise RuntimeError(f"Viewport capture did not create a valid PNG: {output_image}")
+
+
+def capture_scene(runtime: dict, metadata: dict, output_image: Path) -> None:
+    requested = metadata["requested_capture_mode"]
+    order = [requested, *[mode for mode in CAPTURE_MODES if mode != requested]]
+    errors: list[str] = []
+    for mode in order:
+        try:
+            if mode == "camera_sensor":
+                capture_camera_sensor(runtime["world"], metadata, output_image)
+            elif mode == "replicator":
+                capture_replicator(runtime["rep"], metadata, output_image)
+            elif mode == "viewport":
+                capture_viewport(metadata, output_image)
+            else:
+                raise RuntimeError(f"Unknown capture mode: {mode}")
+            metadata["capture_mode"] = mode
+            metadata["actual_capture_camera_path"] = metadata["camera_prim_path"]
+            if errors:
+                metadata["capture_fallback_warnings"] = errors
+            return
+        except Exception as exc:
+            message = f"{mode} capture failed: {exc}"
+            errors.append(message)
+            print(f"Warning: {message}")
+    raise RuntimeError("All capture modes failed. " + " | ".join(errors))
+
+
+def log_scene_debug(metadata: dict) -> None:
+    camera_pose = metadata["camera_pose"]
+    print(f"Scene condition: {metadata['condition']}")
+    print(f"Target class: {metadata['target_class']}")
+    print(f"Camera mode: {metadata['camera_mode']}")
+    print(f"Requested capture mode: {metadata['requested_capture_mode']}")
+    print(f"Camera prim path: {metadata['camera_prim_path']}")
+    print(f"Camera position: {camera_pose['position']}")
+    print(f"Camera look_at: {camera_pose['look_at']}")
+    for obj in metadata["objects"]:
+        prim_path = f"/World/MedicineBoxes/{obj['instance_id']}"
+        print(
+            "Object: "
+            f"class_name={obj['class_name']} "
+            f"position={obj['pose']['position']} "
+            f"dimensions={obj['dimensions']} "
+            f"prim_path={prim_path}"
+        )
+    debug_cube = metadata.get("debug_big_cube", {})
+    if debug_cube.get("enabled"):
+        print(
+            "DebugBigRedCube: "
+            f"position={debug_cube['position']} "
+            f"dimensions={debug_cube['dimensions']} "
+            f"prim_path={debug_cube['prim_path']}"
+        )
+
+
 def write_metadata(metadata: dict, output_metadata: Path) -> None:
     output_metadata.parent.mkdir(parents=True, exist_ok=True)
     output_metadata.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -291,6 +518,7 @@ def main() -> int:
     try:
         ensure_supported(args.condition, args.target_class)
         ensure_camera_mode(args.camera_mode)
+        ensure_capture_mode(args.capture_mode)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -309,16 +537,21 @@ def main() -> int:
         resolution_height=args.resolution_height,
         camera_mode=args.camera_mode,
         box_scale=args.box_scale,
+        capture_mode=args.capture_mode,
+        debug_big_cube=args.debug_big_cube,
     )
 
-    if args.use_textures and not metadata["use_textures"]:
-        print("Warning: no front textures found. Falling back to solid colors and 3D text labels.")
+    if args.use_textures:
+        print("Warning: textures are temporarily disabled for visual scene visibility debugging.")
 
     app = None
     try:
         log_scene_debug(metadata)
         app = start_simulation_app(args.headless, args.resolution_width, args.resolution_height)
-        render_scene(metadata, output_image)
+        runtime = build_usd_scene(metadata)
+        update_stage_metadata(runtime["stage"], runtime["UsdGeom"], runtime["UsdShade"], metadata)
+        write_stage_dump(runtime["stage"], runtime["UsdGeom"], runtime["UsdShade"], metadata, output_metadata)
+        capture_scene(runtime, metadata, output_image)
         metadata["image_path"] = str(output_image.relative_to(project_root()).as_posix())
         write_metadata(metadata, output_metadata)
     except RuntimeError as exc:

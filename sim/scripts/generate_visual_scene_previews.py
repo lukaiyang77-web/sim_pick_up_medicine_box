@@ -5,7 +5,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from visual_scene_utils import CAMERA_MODES, DEFAULT_CONDITION_TARGETS, DEFAULT_OUTPUT_DIR, expected_preview_paths, resolve_project_path
+from visual_scene_utils import (
+    CAMERA_MODES,
+    CAPTURE_MODES,
+    DEFAULT_CONDITION_TARGETS,
+    DEFAULT_OUTPUT_DIR,
+    expected_preview_paths,
+    resolve_project_path,
+)
 
 
 DEBUG_TOPDOWN_TARGETS = {
@@ -20,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_textures", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--camera_mode", choices=sorted(CAMERA_MODES), default="oblique")
+    parser.add_argument("--capture_mode", choices=CAPTURE_MODES, default="camera_sensor")
     parser.add_argument("--box_scale", type=float, default=1.3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resolution_width", type=int, default=1024)
@@ -52,6 +60,8 @@ def run_scene(
         str(seed),
         "--camera_mode",
         camera_mode,
+        "--capture_mode",
+        args.capture_mode,
         "--box_scale",
         str(args.box_scale),
         "--resolution_width",
